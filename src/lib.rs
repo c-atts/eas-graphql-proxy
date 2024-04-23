@@ -16,10 +16,10 @@ lazy_static! {
 pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> worker::Result<Response> {
     let router = Router::new();
     router
-        .get_async("/graphql/:chain", |req, ctx| async move {
+        .get_async("/graphql/:chain/:cache_key", |req, ctx| async move {
             handle_graphql_request(req, ctx).await
         })
-        .post_async("/graphql/:chain", |req, ctx| async move {
+        .post_async("/graphql/:chain/:cache_key", |req, ctx| async move {
             handle_graphql_request(req, ctx).await
         })
         .run(req, env)
@@ -31,32 +31,42 @@ pub async fn handle_graphql_request(
     ctx: RouteContext<()>,
 ) -> worker::Result<Response> {
     if let Some(chain) = ctx.param("chain") {
-        if let Some(uri) = EAS_CHAIN_GQL_ENDPOINT.get(chain.as_str()) {
-            let cache_key = req.headers().get("X-Cache-Key")?.ok_or_else(|| {
-                worker::Error::RustError("X-Cache-Key header is missing".to_string())
-            })?;
+        if ctx.param("cache_key").is_some() {
+            if let Some(uri) = EAS_CHAIN_GQL_ENDPOINT.get(chain.as_str()) {
+                let url = req.url()?;
 
-            let body = req.text().await?;
+                let c = Cache::default();
+                let cached = c.get(url.as_str(), false).await?;
+                if let Some(response) = cached {
+                    return Ok(response);
+                }
 
-            let mut headers = Headers::new();
-            headers.append("Content-Type", "application/json")?;
-            headers.append("User-Agent", "c-atts/0.0.1")?;
+                let body = req.text().await?;
 
-            let mut props = CfProperties::new();
-            props.cache_key = Some(cache_key); // Not working (Enterprise only)
-            props.cache_everything = Some(true);
-            props.cache_ttl = Some(60);
+                let mut headers = Headers::new();
+                headers.append("Content-Type", "application/json")?;
+                headers.append("User-Agent", "c-atts/0.0.1")?;
 
-            let mut init = RequestInit::new();
-            init.with_headers(headers);
-            init.with_method(Method::Post);
-            init.with_body(Some(body.into()));
-            init.with_cf_properties(props);
+                let mut init = RequestInit::new();
+                init.with_headers(headers);
+                init.with_method(Method::Post);
+                init.with_body(Some(body.into()));
 
-            let request = Request::new_with_init(uri, &init)?;
-            return Fetch::Request(request).send().await;
+                let request = Request::new_with_init(uri, &init)?;
+                let response = Fetch::Request(request).send().await;
+
+                match response {
+                    Ok(mut response) => {
+                        let cloned_response = response.cloned()?;
+                        c.put(url.as_str(), cloned_response).await?;
+                        return Ok(response);
+                    }
+                    Err(e) => return Response::error(format!("Error fetching data: {}", e), 500),
+                }
+            }
+            return Response::error("Chain not supported", 400);
         }
-        return Response::error("Chain not supported", 400);
+        return Response::error("Cache key parameter missing", 404);
     }
     Response::error("Chain parameter missing", 404)
 }
